@@ -3,10 +3,10 @@ import math
 import torch.nn as nn
 from torch.nn.init import xavier_uniform_
 import numpy as np
-from utils import get_attn_pad_mask
+from utils import get_attn_pad_mask, get_attn_subsequence_mask
 
 
-# encode和decode阶段可共用
+# encode和decode阶段公用的位置编码
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super(PositionalEncoding, self).__init__()
@@ -34,7 +34,7 @@ class PositionalEncoding(nn.Module):
         return x
 
 
-# 定义了q,k,v的计算encode和decode可共用
+# 定义了q,k,v的计算和mask的过程
 class ScaleDotProductAttention(nn.Module):
     def __init__(self):
         super(ScaleDotProductAttention, self).__init__()
@@ -58,9 +58,9 @@ class ScaleDotProductAttention(nn.Module):
         return context
 
 
-# 多头机制，共用
+# 多头机制
 class MultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.) -> None:
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.) -> None:
         super(MultiheadAttention, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -84,12 +84,12 @@ class MultiheadAttention(nn.Module):
         xavier_uniform_(self.k_w.weight)
         xavier_uniform_(self.v_w.weight)
 
-    def forward(self, query, key, value, enc_attn_mask):
+    def forward(self, query, key, value, attn_mask):
         '''
         :param query: [b_z, seq, 768]
         :param key: [b_z, seq, 768]
         :param value: [b_z, seq, 768]
-        :param enc_attn_mask: [b_z, seq, seq]
+        :param attn_mask: [b_z, seq, seq]
         '''
         residual, b_s = query, query.size(0)
         d_k = self.embed_dim // self.num_heads
@@ -98,23 +98,23 @@ class MultiheadAttention(nn.Module):
         K = self.k_w(key).view(b_s, -1, self.num_heads, d_k).transpose(1, 2)
         V = self.v_w(value).view(b_s, -1, self.num_heads, d_k).transpose(1, 2)
 
-        attn_mask = enc_attn_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
         scale = ScaleDotProductAttention()
         # context: [b_z, nums_head, seq, d_k]
         context = scale(Q, K, V, attn_mask, d_k)
 
         context = context.transpose(1, 2).reshape(b_s, -1, self.embed_dim)
 
-        output = self.fc(context)
-        output += residual
-        output = nn.LayerNorm(self.embed_dim)(output)
+        outputs = self.fc(context)
+        outputs += residual
+        outputs = nn.LayerNorm(self.embed_dim)(outputs)
 
-        return output
+        return outputs
 
 
-# 前馈网络共用
+# 前馈网络
 class FeedForWard(nn.Module):
-    def __init__(self, d_model, feed_forward_dim, dropout):
+    def __init__(self, d_model: int, feed_forward_dim: int, dropout: float):
         super(FeedForWard, self).__init__()
         self.d_model = d_model
         self.fc = nn.Sequential(
@@ -133,6 +133,7 @@ class FeedForWard(nn.Module):
         return output
 
 
+# 定义encoder中的每个层
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float=0.1, feedforward_dim: int=3072):
         super(TransformerEncoderLayer, self).__init__()
@@ -146,10 +147,11 @@ class TransformerEncoderLayer(nn.Module):
         return output
 
 
+# 定义encoder
 class TransformerEncoder(nn.Module):
     def __init__(self, args):
         super(TransformerEncoder, self).__init__()
-        self.src_emb = nn.Embedding(args.vocab_size, args.d_model)
+        self.src_emb = nn.Embedding(args.vocab_enc_size, args.d_model)
         self.pos_emb = PositionalEncoding(args.d_model, args.dropout)
         self.layers = nn.ModuleList([TransformerEncoderLayer(args.d_model, args.nums_head, args.dropout, args.feedforward_dim)
                                      for _ in range(args.n_layers)])
@@ -163,3 +165,62 @@ class TransformerEncoder(nn.Module):
             outputs = layer(outputs, enc_attn_mask)
 
         return outputs
+
+
+# 定义decoder中的每个层
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, feedforward_dim: int, dropout: float=0.):
+        super(TransformerDecoderLayer, self).__init__()
+        self.dec_self_attn = MultiheadAttention(d_model, num_heads, dropout=0.)
+        self.dec_enc_attn = MultiheadAttention(d_model, num_heads, dropout=0.)
+        self.feedforward = FeedForWard(d_model, feedforward_dim, dropout=dropout)
+
+    def forward(self, dec_inputs, enc_inputs, dec_self_attn_mask, dec_enc_attn_mask):
+        output = self.dec_self_attn(dec_inputs, dec_inputs, dec_inputs, dec_self_attn_mask)
+        output = self.dec_enc_attn(enc_inputs, output, output, dec_enc_attn_mask)
+        output = self.feedforward(output)
+
+        return output
+
+
+# 定义decoder
+class TransformerDecoder(nn.Module):
+    def __init__(self, args):
+        super(TransformerDecoder, self).__init__()
+        self.tgt_emb = nn.Embedding(args.vocab_dec_size, args.d_model)
+        self.pos_emb = PositionalEncoding(args.d_model, args.dropout)
+        self.layers = [TransformerDecoderLayer(args.d_model, args.nums_head, args.feedforward_dim, args.dropout)
+                       for _ in range(args.n_layers)]
+
+    def forward(self, enc_inputs, dec_inputs, enc_outputs):
+        dec_outputs = self.tgt_emb(dec_inputs)
+        dec_outputs = self.pos_emb(dec_outputs)
+
+        # 自注意力的遮蔽和倒三角合并
+        dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs)
+        dec_self_attn_subsequence_mask = get_attn_subsequence_mask(dec_inputs)
+        # 两种decoder阶段输入的mask可以进行叠加变成一个
+        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_subsequence_mask), 0)
+
+        dec_enc_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs)
+
+        for layer in self.layers:
+            dec_outputs = layer(dec_outputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask)
+
+        return dec_outputs
+
+
+# transformer模型行总运行流程
+class Transformer(nn.Module):
+    def __init__(self, args):
+        super(Transformer, self).__init__()
+        self.encode = TransformerEncoder(args)
+        self.decode = TransformerDecoder(args)
+        self.projection = nn.Linear(args.d_model, args.vocab_dec_size)
+
+    def forward(self, enc_inputs, dec_inputs):
+        enc_outputs = self.encode(enc_inputs)
+        dec_outputs = self.decode(enc_inputs, dec_inputs, enc_outputs)
+        dec_logits = self.projection(dec_outputs)
+
+        return dec_logits.view(-1, dec_logits.size(-1))
